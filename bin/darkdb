@@ -1,0 +1,750 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+################################################################################
+# DarkDB.rb
+################################################################################
+#
+# DarkDB reader/writer for Dark Engine games, Thief 1/Gold/2 & System Shock 2.
+# https://github.com/daftmugi/darkdb
+
+################################################################################
+# DarkDB Spec                                                                  #
+################################################################################
+#
+# DarkDB
+#     Header
+#     Chunk Data
+#       Chunk Item Header
+#       Chunk Item
+#     Table of Contents
+#       TOC Item
+#
+# Header (272 bytes)
+#     4 bytes (u32)                       : offset to TOC Header
+#   264 bytes                             : (ignore for this program)
+#     4 bytes                             : 0xDEADBEEF
+#
+# TOC Header (Table of Contents Header)
+#     4 bytes (u32)                       : number of items
+#
+# TOC Items:
+#     12 bytes (null-terminated string)   : item/chunk name
+#      4 bytes (u32)                      : chunk offset DB start
+#      4 bytes (u32)                      : chunk size (not including header)
+#
+# Chunk Item Header (24 bytes):
+#     12 bytes (null-terimated string)    : name
+#     12 bytes                            : (ignore for this program)
+#
+# QUEST Chunk Item:
+#      4 byte header (u32)                : size of key string
+#      X bytes (null-terminated string)   : key string
+#      4 bytes (i32)                      : value
+#
+# BRHEAD Chunk Item:
+#     16 bytes (null-terminated string)  : user ("Info Window - last edited by")
+#     16 bytes (null-terminated string)  : creator ("Info Window - created by")
+#     88 bytes                           : (ignore for this program)
+#      4 bytes (u32)                     : edit time (cumulative time in milliseconds)
+
+################################################################################
+# MIT License                                                                  #
+################################################################################
+#
+# Copyright (c) 2023 Daft Mugi
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.0.0")
+  abort("Ruby 3.0+ is required")
+end
+
+require "did_you_mean"
+require "fileutils"
+
+class DarkDB
+  VERSION = "1.0.0"
+
+  U32_MIN  =  0
+  U32_MAX  =  4_294_967_295
+  I32_MIN  = -2_147_483_648
+  I32_MAX  =  2_147_483_647
+  INT_SIZE =  4
+
+  HEADER_SIZE        = 272
+  CHUNK_HEADER_SIZE  = 24
+  CHUNK_NAME_SIZE    = 12
+  CHUNK_IGNORE_SIZE  = 12
+  BRHEAD_USER_SIZE   = 16
+  BRHEAD_IGNORE_SIZE = 88
+
+  TocItem   = Struct.new(:name, :offset, :size, keyword_init: true)
+  ChunkItem = Struct.new(:name, :offset, :type, :size, :value, keyword_init: true)
+  Chunk     = Struct.new(:name, :items, keyword_init: true)
+
+  BRHEAD    = "BRHEAD"
+  QUEST_DB  = "QUEST_DB"
+  QUEST_CMP = "QUEST_CMP"
+
+  TABLE_TO_CHUNK_NAME_MAP = {
+    "info"     => BRHEAD,
+    "questdb"  => QUEST_DB,
+    "questcmp" => QUEST_CMP,
+  }
+
+  BRHEAD_KEY_CREATOR = "created_by"
+  BRHEAD_KEY_USER    = "last_saved_by"
+  BRHEAD_KEY_TIME    = "total_time"
+
+  attr_reader :options
+
+  def self.main(args = ARGV)
+    debug_mode = !!args.delete("--debug")
+    self.new.run(args)
+  rescue => e
+    raise e if debug_mode
+    abort(e.message)
+  end
+
+  def initialize(opts = nil)
+    @options = default_options()
+    set_options(opts) if opts
+  end
+
+  def default_options
+    {
+      table: nil,
+      op: nil,
+      mis_path: nil,
+      key_regex: nil,
+      new_value: nil,
+      regex_ignore_case: false,
+    }
+  end
+
+  def set_options(opts)
+    @options.merge!(opts)
+  end
+
+  def run(args)
+    # For "Ctrl-c" at prompts
+    Signal.trap("SIGINT", "SYSTEM_DEFAULT")
+
+    cli_options = process_args(args)
+    set_options(cli_options)
+
+    case options[:op]
+    when :get then get()
+    when :set then set()
+    else      raise(usage)
+    end
+  end
+
+  def usage
+    cmd = File.basename($0)
+
+    <<~EOS
+    #{cmd} version #{VERSION}
+
+    Usage: #{cmd} TABLE MIS_FILE [-i] [KEY_REGEX]
+           #{cmd} TABLE MIS_FILE [-i]  KEY_REGEX  NEW_VALUE
+
+    DB Table (TABLE):
+      info                  : DromEd 'Info Window' Data ('mis' file)
+      questdb               : Mission Quest Data ('mis' or 'sav' file)
+      questcmp              : Campaign Quest Data ('sav' file)
+
+    Options:
+      --help                : print this message
+      --version             : print version
+      --debug               : more detailed error messages
+      -i                    : case insensitive KEY_REGEX
+
+      MIS_FILE              : path to 'mis' file (or 'sav' file)
+      KEY_REGEX             : match key (using a regular expression)
+      NEW_VALUE             : set key to new value
+
+    Examples:
+      # Print all Quest Data key-value pairs
+      #{cmd} questdb miss20.mis
+
+      # Print Quest Data key-value pairs, matching all loot goals
+      #{cmd} questdb miss20.mis goal_loot
+
+      # Print Quest Data key-value pairs, matching loot goal 2
+      #{cmd} questdb miss20.mis goal_loot_2
+
+      # Print Quest Data key-value pairs, matching loot goals 1 and 3
+      #{cmd} questdb miss20.mis 'goal_loot_[13]'
+
+      # Set all loot goals to a new value
+      #{cmd} questdb miss20.mis goal_loot 500
+
+      # Set specific loot goal to a new value
+      #{cmd} questdb miss20.mis goal_loot_2 500
+
+      # Change loot goals 1 and 3 to a new value
+      #{cmd} questdb miss20.mis 'goal_loot_[13]' 500
+
+      # Change created-by author to a new value
+      #{cmd} info miss20.mis created_by 'Author Name'
+
+      # Change DromEd total time using milliseconds
+      #{cmd} info miss20.mis total_time 45100451
+
+      # Change DromEd total time using time string
+      #{cmd} info miss20.mis total_time '3:21:12:30'
+      #{cmd} info miss20.mis total_time '21:12:30'
+      #{cmd} info miss20.mis total_time '12:30'
+      #{cmd} info miss20.mis total_time '0:30'
+    EOS
+  end
+
+  def process_args(args)
+    opts = {}
+
+    if args.include?("-h") || args.include?("--help")
+      puts(usage)
+      exit(0)
+    end
+    if args.include?("--version")
+      puts(VERSION)
+      exit(0)
+    end
+    opts[:regex_ignore_case] = !!args.delete("-i")
+
+    raise(usage) if args.size < 2
+
+    opts[:op]        = args.size < 4 ? :get : :set
+    opts[:table]     = args[0]
+    opts[:mis_path]  = args[1]
+    opts[:key_regex] = args[2] if args[2]
+    opts[:new_value] = args[3] if opts[:op] == :set
+
+    opts
+  end
+
+
+  ##############################################################################
+  # OPS
+  ##############################################################################
+
+  def get
+    perform_op do |chunk|
+      print_chunk(chunk)
+    end
+  end
+
+  def set
+    perform_op do |chunk|
+      modify_mission_file(options[:mis_path], chunk, options[:new_value])
+    end
+  end
+
+  def perform_op(&block)
+    validate_options(options)
+    chunk_name = table_to_chunk_name(options[:table])
+    chunk = read_chunk_from_file(options[:mis_path], chunk_name)
+    filtered_chunk =
+      filter_chunk_items(chunk, options[:key_regex], options[:regex_ignore_case])
+    yield(filtered_chunk)
+  end
+
+
+  ##############################################################################
+  # OP HELPERS
+  ##############################################################################
+
+  def validate_options(opts)
+    if opts[:table].nil?
+      raise("TABLE not specified.")
+    end
+
+    unless File.exist?(options[:mis_path])
+      raise("File not found: %s" % options[:mis_path])
+    end
+  end
+
+  def table_to_chunk_name(table)
+    name = TABLE_TO_CHUNK_NAME_MAP[table]
+
+    unless name
+      similar = TABLE_TO_CHUNK_NAME_MAP.keys.reduce([]) do |acc, key|
+        score = DidYouMean::JaroWinkler.distance(key, table)
+        acc << key if score > 0.8
+        acc
+      end
+
+      if similar.empty?
+        raise(usage)
+      else
+        msg = <<~EOS
+        Invalid TABLE name. Did you mean?
+          #{similar.join("\n  ")}
+        EOS
+        raise(msg)
+      end
+    end
+
+    name
+  end
+
+  def read_chunk_from_file(mis_path, chunk_name)
+    open_file(mis_path) do |f|
+      extract_chunk(f, chunk_name)
+    end
+  end
+
+  def filter_chunk_items(chunk, key_regex = nil, ignore_case = false)
+    if key_regex
+      filter = Regexp.new(key_regex, ignore_case)
+      chunk.items = chunk.items.filter { |k, _| k.match?(filter) }
+      chunk
+    else
+      chunk
+    end
+  end
+
+  def time_key?(chunk, key)
+    (chunk.name == BRHEAD && key == BRHEAD_KEY_TIME) ||
+    (key == "DrSTime") ||
+    (key == "DrSCmTime")
+  end
+
+  def print_chunk(chunk)
+    $stderr.puts("File: %s" % options[:mis_path])
+
+    key_width = chunk.items
+      .keys
+      .map { |k| k.size }
+      .max()
+
+    value_width = chunk.items
+      .values
+      .map { |v| v.value.to_s.size }
+      .max()
+
+    sorted_keys =
+      if chunk.name == BRHEAD
+        # Do not sort BRHEAD alphanumerically.
+        # Instead, sort it by the following order.
+        [BRHEAD_KEY_CREATOR, BRHEAD_KEY_USER, BRHEAD_KEY_TIME]
+      else
+        # * Sort keys alphanumerically.
+        # * Keys tend to be in the form `<name1>_<name2>_<num>`,
+        #   such as `goal_loot_1`.
+        # * Keys can be lowercase, uppercase, or mixed case,
+        #   such as `goal_loot_1`, `GOAL_STATE_5`, and `DrSTime`.
+        # * Keys can be an empty string (blank).
+        # * Keys can start with a number and only be a number,
+        #   such as `0` or `1`.
+        # * Keys can start with an uncommon character,
+        #   such as `=`.
+        # * Keys are downcased before the sort so that keys with
+        #   differing case, but matching name, are grouped together,
+        #   such as `goal_loot_1` and `GOAL_LOOT_2`.
+        # * The key number suffix is converted from a string to a number
+        #   before sorting so that numbers are sorted correctly,
+        #   such as `1` in `goal_state_1` and `10` in `goal_state_10`.
+        chunk.items.keys.sort_by do |x|
+          [(x[/[^\d]+/] || "").downcase(), x[/\d+/].to_i()]
+        end
+      end
+
+    sorted_keys.each do |key|
+      next unless chunk.items.has_key?(key)
+      key_string = key.ljust(key_width)
+      value = chunk.items[key].value
+      left_padding = 10
+      value_string = value.to_s.rjust(value_width + left_padding)
+
+      if time_key?(chunk, key)
+        value_string += " (string: #{int_to_time_string(value)})"
+      end
+
+      puts("%s %s" % [key_string, value_string])
+    end
+  end
+
+  def modify_mission_file(mis_path, chunk, new_value)
+    # Create changeset here so that input validation occurs before
+    # user prompts and file writing.
+    changeset = convert_input_to_changeset(chunk, new_value)
+
+    exit unless user_gave_ok_to_overwrite?(mis_path)
+    back_up_file(mis_path)
+
+    open_file(mis_path, :read_write) do |f|
+      modify_mission(f, changeset)
+      puts("Wrote %s" % f.path)
+    end
+  end
+
+  def convert_input_to_changeset(chunk, new_value)
+    chunk.items.values.reduce([]) do |acc, item|
+      nv =
+        if time_key?(chunk, item.name)
+          parse_edit_time(new_value)
+        else
+          new_value
+        end
+
+      new_value_bytes =
+        case item.type
+        when :u32
+          pack_u32(parse_u32(nv))
+
+        when :i32
+          pack_i32(parse_i32(nv))
+
+        when :string
+          pack_string(nv, item.size)
+        end
+
+      acc << [item.offset, new_value_bytes]
+      acc
+    end
+  end
+
+  def modify_mission(io, changeset)
+    changeset.each do |offset, new_value_bytes|
+      io.seek(offset)
+      io.write(new_value_bytes)
+    end
+  end
+
+
+  ##############################################################################
+  # FILE HELPERS
+  ##############################################################################
+
+  def open_file(mis_path, mode = nil, &block)
+    mode_str = mode == :read_write ? "r+b" : "rb"
+    File.open(mis_path, mode_str, &block)
+  end
+
+  def back_up_file(path)
+    backup_path = "%s.bak" % path
+    return if File.exist?(backup_path)
+    FileUtils.cp(path, backup_path, preserve: true)
+    puts("Created backup %s" % backup_path)
+  rescue
+    raise("File write error: %s" % backup_path)
+  end
+
+  def user_gave_ok_to_overwrite?(path)
+    return true if ENV["DARKDB_ENV"] == "test"
+    print("Overwrite %s [Yn] " % path)
+    $stdout.flush()
+    choice = $stdin.readline().strip()
+    ["", "y", "Y"].include?(choice)
+  end
+
+
+  ##############################################################################
+  # BINARY HELPERS
+  ##############################################################################
+
+  # read u32 little endian
+  def read_u32(io, offset = nil)
+    io.seek(offset) if offset
+    bytes = io.read(INT_SIZE)
+    bytes.unpack("L<")[0]
+  end
+
+  # read i32 little endian
+  def read_i32(io, offset = nil)
+    io.seek(offset) if offset
+    bytes = io.read(INT_SIZE)
+    bytes.unpack("l<")[0]
+  end
+
+  # pack int as u32 little endian
+  def pack_u32(int)
+    [int].pack("L<")
+  end
+
+  # pack int as i32 little endian
+  def pack_i32(int)
+    [int].pack("l<")
+  end
+
+  def read_string(io, size, offset = nil)
+    io.seek(offset) if offset
+    bytes = io.read(size)
+    bytes = bytes.unpack("C*")
+    null_byte = 0
+
+    null_byte_offset = bytes.find_index { |x| x == null_byte }
+    raise("Invalid string conversion.") if null_byte_offset.nil?
+
+    bytes[0...null_byte_offset].pack("C*")
+  end
+
+  def pack_string(string, size)
+    begin
+      # ensure ASCII-8BIT before packing
+      string = string.encode(Encoding::ASCII_8BIT)
+    rescue
+      raise("Value contains invalid characters. Must be ASCII characters.")
+    end
+
+    unless string.size < size
+      raise("Value too long. Must be fewer than #{size} characters.")
+    end
+
+    bytes = [string].pack("a#{size}") # null-padded binary string
+    bytes[-1] = "\0" # ensure null-terminated string
+    bytes
+  end
+
+  def parse_u32(value)
+    parse_int(value, U32_MIN, U32_MAX)
+  end
+
+  def parse_i32(value)
+    parse_int(value, I32_MIN, I32_MAX)
+  end
+
+  def parse_int(value, min = I32_MIN, max = I32_MAX)
+    begin
+      int = Integer(value)
+    rescue ArgumentError
+      raise("Value contains invalid characters.")
+    rescue
+      raise("Value invalid")
+    end
+
+    raise("Value too high. Must be %d or less." % max) if int > max
+    raise("Value too low. Must be %d or more." % min)  if int < min
+
+    int
+  end
+
+
+  ##############################################################################
+  # EDIT TIME
+  ##############################################################################
+
+  def parse_edit_time(value)
+    # The user can supply the time value as an number (milliseconds)
+    # or as a colon-separated set of numbers denoting the
+    # 'day:hour:min:sec'.
+    if value.include?(":")
+      parse_time_string(value).to_s() # match other return value type
+    else
+      value
+    end
+  end
+
+  def parse_time_string(string)
+    # This handles time segments, such as 'dd:hh:mm:ss',
+    # as well as partial segments, such as 'mm:ss'.
+    # Undefined segments are set to 0.
+    segments = string.split(":").reverse()
+    sec      = parse_time_segment(segments[0], :sec)
+    min      = parse_time_segment(segments[1], :min)
+    hour     = parse_time_segment(segments[2], :hour)
+    day      = parse_time_segment(segments[3], :day)
+
+    max = 59
+    [min, sec].each do |t|
+      raise("Time (min, sec) cannot be greater than #{max}.") if t > max
+    end
+
+    max_hour = 23
+    raise("Time (hour) cannot be greater than #{max_hour}.") if hour > max_hour
+
+    time  = 0
+    time += sec  *  1000
+    time += min  * (1000 * 60)
+    time += hour * (1000 * 60 * 60)
+    time += day  * (1000 * 60 * 60 * 24)
+    time
+  end
+
+  def parse_time_segment(segment, type = nil)
+    return 0 if segment.nil?
+
+    begin
+      int = Integer(segment)
+    rescue
+      raise("Time contains invalid numbers.") if type.nil?
+      raise("Time (#{type.to_s()}) is not a valid number.")
+    end
+
+    int
+  end
+
+  def int_to_time_string(int)
+    fmt_str = "%d:%2.2d:%2.2d:%2.2d"
+    fmt_str % [
+      ms_to_day(int),
+      ms_to_hour(int),
+      ms_to_min(int),
+      ms_to_sec(int)
+    ]
+  end
+
+  def ms_to_sec(milliseconds)
+    ((milliseconds.to_f / 1000) % 60).to_i()
+  end
+
+  def ms_to_min(milliseconds)
+    ((milliseconds.to_f / (1000 * 60)) % 60).to_i()
+  end
+
+  def ms_to_hour(milliseconds)
+    ((milliseconds.to_f / (1000 * 60 * 60)) % 24).to_i()
+  end
+
+  def ms_to_day(milliseconds)
+    (milliseconds.to_f / (1000 * 60 * 60 * 24)).to_i()
+  end
+
+
+  ##############################################################################
+  # MIS/SAV FILE
+  ##############################################################################
+
+  def extract_chunk(io, chunk_name)
+    validate_mis_file(io)
+    toc_item = read_toc_item(io, chunk_name)
+    read_chunk(io, toc_item)
+  end
+
+  def validate_mis_file(io)
+    raise("Empty file: #{io.path}") if io.size == 0
+
+    io.seek(0)
+    header = io.read(HEADER_SIZE)
+    last_four = header.bytes[-4..]
+
+    unless last_four == [0xDE, 0xAD, 0xBE, 0xEF]
+      raise("Invalid file: #{io.path}")
+    end
+  end
+
+  def read_toc_offset(io)
+    read_u32(io, 0)
+  end
+
+  def read_toc(io)
+    items = {}
+    toc_offset = read_toc_offset(io)
+    items_length = read_u32(io, toc_offset)
+
+    count = 0
+    while count < items_length
+      chunk_name = read_string(io, CHUNK_NAME_SIZE)
+      chunk_offset = read_u32(io)
+      chunk_size = read_u32(io)
+
+      items[chunk_name] = TocItem.new(
+        name: chunk_name,
+        offset: chunk_offset,
+        size: chunk_size
+      )
+
+      count += 1
+    end
+
+    items
+  end
+
+  def read_toc_item(io, toc_item_name)
+    toc_items = read_toc(io)
+    toc_item = toc_items[toc_item_name]
+    raise("#{toc_item_name} not found.")    unless toc_item
+    raise("#{toc_item_name} has no items.")     if toc_item.size == 0
+    toc_item
+  end
+
+  def create_chunk_item(io, key_name, type, size, &block)
+    value_offset = io.tell()
+    value = yield(io)
+    ChunkItem.new(name: key_name, offset: value_offset, type: type, size: size, value: value)
+  end
+
+  def create_chunk_item_i32(io, key_name)
+    create_chunk_item(io, key_name, :i32, 4) { |io| read_i32(io) }
+  end
+
+  def create_chunk_item_u32(io, key_name)
+    create_chunk_item(io, key_name, :u32, 4) { |io| read_u32(io) }
+  end
+
+  def create_chunk_item_string(io, key_name, size)
+    create_chunk_item(io, key_name, :string, size) { |io| read_string(io, size) }
+  end
+
+  def read_chunk(io, toc_item)
+    name = read_string(io, CHUNK_NAME_SIZE, toc_item.offset)
+    io.read(CHUNK_IGNORE_SIZE) # throw away some info
+
+    items =
+      case name
+      when QUEST_DB, QUEST_CMP then read_chunk_quest(io, toc_item, io.tell())
+      when BRHEAD              then read_chunk_brhead(io, toc_item, io.tell())
+      else                     raise("Unsupported Chunk Type")
+      end
+
+    Chunk.new(name: name, items: items)
+  end
+
+  def read_chunk_quest(io, toc_item, offset = nil)
+    hash = {}
+    chunk_size = toc_item.size # data size (not including header size)
+    next_chunk_offset = toc_item.offset + CHUNK_HEADER_SIZE + chunk_size
+
+    io.seek(offset) if offset
+    while io.tell() < next_chunk_offset
+      key_name_length = read_u32(io)
+      key_name = read_string(io, key_name_length)
+      key_name = "(blank)" if key_name.empty?
+      hash[key_name] = create_chunk_item_i32(io, key_name)
+    end
+
+    hash
+  end
+
+  def read_chunk_brhead(io, toc_item, offset = nil)
+    hash = {}
+
+    io.seek(offset) if offset
+
+    hash[BRHEAD_KEY_USER] =
+      create_chunk_item_string(io, BRHEAD_KEY_USER, BRHEAD_USER_SIZE)
+
+    hash[BRHEAD_KEY_CREATOR] =
+      create_chunk_item_string(io, BRHEAD_KEY_CREATOR, BRHEAD_USER_SIZE)
+
+    io.read(BRHEAD_IGNORE_SIZE) # throw away some info
+
+    hash[BRHEAD_KEY_TIME] =
+      create_chunk_item_u32(io, BRHEAD_KEY_TIME)
+
+    hash
+  end
+end
+
+if $0 == __FILE__
+  DarkDB.main()
+end
